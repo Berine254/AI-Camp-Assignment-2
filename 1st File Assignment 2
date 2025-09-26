@@ -1,0 +1,193 @@
+# Synthetic demo for "Responsible AI Detective" assignment
+# - Case 1: Biased Hiring Bot -> show bias, then mitigation by removing career_gap and adding human review
+# - Case 2: Overzealous School Proctor -> show eye-only flagging causing higher false positives for neurodivergent students,
+#   then mitigate by multi-signal rule + teacher review
+#
+# This code is for educational/demo purposes. It creates synthetic data, trains a simple classifier,
+# and prints metrics that highlight fairness issues and improvements.
+#
+# Run in a Jupyter environment. No external data required.
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix
+
+np.random.seed(42)
+
+# ------------------------
+# Case 1: Biased Hiring Bot
+# ------------------------
+def generate_hiring_data(n=2000, bias_strength=2.0):
+    # Features: experience_years (0-15), career_gap (0/1), skills_score (0-1), gender (0=male,1=female)
+    experience = np.random.poisson(5, size=n).astype(float)
+    skills = np.clip(np.random.normal(0.6, 0.15, size=n), 0, 1)
+    gender = np.random.binomial(1, 0.5, size=n)  # 1 = female
+    # career_gap more common among female in this synthetic setup
+    career_gap = np.random.binomial(1, 0.15 + 0.2*gender, size=n)
+    # True hiring probability (biased historical process): penalizes career gap strongly
+    logits = -3.0 + 0.2*experience + 3.0*skills - bias_strength*career_gap + 0.3*(1 - gender) # slight male-favored historical noise
+    prob = 1 / (1 + np.exp(-logits))
+    hired = np.random.binomial(1, prob)
+    df = pd.DataFrame({
+        'experience': experience,
+        'skills': skills,
+        'career_gap': career_gap,
+        'gender': gender,
+        'hired': hired
+    })
+    return df
+
+df_hire = generate_hiring_data()
+
+# Train a simple logistic classifier using all features
+X = df_hire[['experience', 'skills', 'career_gap']]
+y = df_hire['hired']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=1)
+
+clf_all = LogisticRegression(solver='liblinear').fit(X_train, y_train)
+
+# Predictions and selection rates
+df_test = X_test.copy().reset_index(drop=True)
+df_test['gender'] = df_hire.loc[X_test.index, 'gender'].values
+df_test['y_true'] = y_test.reset_index(drop=True)
+df_test['y_pred'] = clf_all.predict(X_test)
+
+def selection_rates_by_gender(df, pred_col='y_pred'):
+    rates = df.groupby('gender')[pred_col].mean().rename({0:'male',1:'female'})
+    return rates
+
+print("=== Case 1: Biased Hiring Bot ===")
+print("\nSelection (shortlist) rates by gender using model trained WITH career_gap feature:")
+print(selection_rates_by_gender(df_test, 'y_pred'))
+
+# Measure how much career_gap influences decisions via model coefficient
+coef_idx = list(X.columns).index('career_gap')
+print("\nModel coefficient for career_gap (higher negative -> penalizes gaps):", clf_all.coef_[0][coef_idx])
+
+# Mitigation: Remove career_gap from features and retrain
+X_no_gap = df_hire[['experience', 'skills']]
+Xn_train, Xn_test, yn_train, yn_test = train_test_split(X_no_gap, y, test_size=0.4, random_state=1)
+clf_nogap = LogisticRegression(solver='liblinear').fit(Xn_train, yn_train)
+
+df_test2 = Xn_test.copy().reset_index(drop=True)
+df_test2['gender'] = df_hire.loc[Xn_test.index, 'gender'].values
+df_test2['y_pred'] = clf_nogap.predict(Xn_test)
+
+print("\nSelection rates by gender AFTER removing career_gap from model features:")
+print(selection_rates_by_gender(df_test2, 'y_pred'))
+
+# Add a "human review" step for borderline scores (prob between 0.4 and 0.6)
+probs = clf_nogap.predict_proba(Xn_test)[:,1]
+df_test2['prob'] = probs
+def human_review_decision(row):
+    if 0.4 <= row['prob'] <= 0.6:
+        # human reviews and flips negative if female & gap historically (simulated fair human check)
+        # For demo: human decides based on skills threshold to avoid automatic bias
+        return 1 if row['skills'] > 0.55 else 0
+    return int(row['prob'] > 0.5)
+
+df_test2['final_decision_with_human'] = df_test2.apply(human_review_decision, axis=1)
+
+print("\nSelection rates by gender AFTER adding a human review step for borderline candidates:")
+print(selection_rates_by_gender(df_test2, 'final_decision_with_human'))
+
+# Show a tiny sample
+print("\nSample of test predictions (first 8 rows):")
+display_df1 = df_test2[['experience','skills','gender','prob','y_pred','final_decision_with_human']].head(8)
+import caas_jupyter_tools as tools; tools.display_dataframe_to_user("Hiring Bot Test Sample", display_df1)
+
+# -------------------------------
+# Case 2: Overzealous School Proctor
+# -------------------------------
+def generate_proctor_data(n=2000):
+    # neurodivergent more likely to have high eye movement variance but not cheating
+    neuro = np.random.binomial(1, 0.2, size=n)  # 20% neurodivergent
+    eye_movement = np.clip(np.random.normal(0.3 + 0.3*neuro, 0.15, size=n), 0, 1)  # higher on avg if neurodivergent
+    keyboard_activity = np.clip(np.random.normal(0.5, 0.2, size=n), 0, 1)
+    # audio_flag: sometimes indicates possible cheating (0 or 1), independent small chance
+    audio_flag = np.random.binomial(1, 0.05, size=n)
+    # True cheating (rare): depends on keyboard_activity very low & audio_flag high & random
+    logits = -4.0 + 2.0*(keyboard_activity < 0.2).astype(int) + 3.0*audio_flag
+    prob_cheat = 1/(1+np.exp(-logits))
+    cheated = np.random.binomial(1, prob_cheat)
+    df = pd.DataFrame({
+        'neurodivergent': neuro,
+        'eye_movement': eye_movement,
+        'keyboard_activity': keyboard_activity,
+        'audio_flag': audio_flag,
+        'cheated': cheated
+    })
+    return df
+
+df_proc = generate_proctor_data()
+
+# Baseline proctor: flags if eye_movement > 0.6 (eye-only rule)
+df_proc['eye_flag'] = (df_proc['eye_movement'] > 0.6).astype(int)
+
+def false_positive_rate(df, flag_col='eye_flag'):
+    # false positive = flagged but didn't cheat
+    fp = ((df[flag_col] == 1) & (df['cheated'] == 0)).sum()
+    neg = (df['cheated'] == 0).sum()
+    return fp / neg if neg>0 else 0
+
+fp_overall_eye = false_positive_rate(df_proc, 'eye_flag')
+fp_neuro_eye = false_positive_rate(df_proc[df_proc['neurodivergent']==1], 'eye_flag')
+fp_non_neuro_eye = false_positive_rate(df_proc[df_proc['neurodivergent']==0], 'eye_flag')
+
+print("\n=== Case 2: Overzealous School Proctor ===")
+print("\nBaseline eye-only flagging false positive rates:")
+print(f"Overall FP rate: {fp_overall_eye:.3f}")
+print(f"FP rate for neurodivergent students: {fp_neuro_eye:.3f}")
+print(f"FP rate for non-neurodivergent students: {fp_non_neuro_eye:.3f}")
+
+# Mitigation: multi-signal rule (flag if at least two of eye_flag, low keyboard activity, audio_flag are positive)
+df_proc['kbd_flag'] = (df_proc['keyboard_activity'] < 0.2).astype(int)
+df_proc['audio_flag'] = df_proc['audio_flag']  # already 0/1
+
+def multi_signal_flag(row):
+    signals = row['eye_flag'] + row['kbd_flag'] + row['audio_flag']
+    return 1 if signals >= 2 else 0
+
+df_proc['multi_flag'] = df_proc.apply(multi_signal_flag, axis=1)
+
+fp_overall_multi = false_positive_rate(df_proc, 'multi_flag')
+fp_neuro_multi = false_positive_rate(df_proc[df_proc['neurodivergent']==1], 'multi_flag')
+fp_non_neuro_multi = false_positive_rate(df_proc[df_proc['neurodivergent']==0], 'multi_flag')
+
+print("\nMulti-signal flagging false positive rates:")
+print(f"Overall FP rate: {fp_overall_multi:.3f}")
+print(f"FP rate for neurodivergent students: {fp_neuro_multi:.3f}")
+print(f"FP rate for non-neurodivergent students: {fp_non_neuro_multi:.3f}")
+
+# Add human review: teacher reviews flags for neurodivergent students and only confirms if audio_flag==1 or kbd_flag==1
+def teacher_review(row):
+    if row['multi_flag'] == 0:
+        return 0  # not flagged
+    if row['neurodivergent'] == 1:
+        # human double-check: require either audio_flag or kbd_flag to confirm
+        return 1 if (row['audio_flag']==1 or row['kbd_flag']==1) else 0
+    # non-neurodivergent: accept multi_flag as is (teacher quick check)
+    return 1
+
+df_proc['final_flag_with_teacher'] = df_proc.apply(teacher_review, axis=1)
+
+fp_overall_teacher = false_positive_rate(df_proc, 'final_flag_with_teacher')
+fp_neuro_teacher = false_positive_rate(df_proc[df_proc['neurodivergent']==1], 'final_flag_with_teacher')
+fp_non_neuro_teacher = false_positive_rate(df_proc[df_proc['neurodivergent']==0], 'final_flag_with_teacher')
+
+print("\nAfter teacher review for flagged cases (esp. neurodivergent):")
+print(f"Overall FP rate: {fp_overall_teacher:.3f}")
+print(f"FP rate for neurodivergent students: {fp_neuro_teacher:.3f}")
+print(f"FP rate for non-neurodivergent students: {fp_non_neuro_teacher:.3f}")
+
+# Small sample to inspect
+display_df2 = df_proc[['neurodivergent','eye_movement','keyboard_activity','audio_flag','eye_flag','multi_flag','final_flag_with_teacher','cheated']].head(10)
+tools.display_dataframe_to_user("Proctoring Test Sample", display_df2)
+
+print("\n\n--- End of demo ---\n")
+print("What this shows (summary):")
+print(" - Hiring bot: including 'career_gap' led to lower selection rates for female candidates. Removing the feature and adding human review reduced the disparity.")
+print(" - Proctoring bot: eye-only flagging creates higher false positives for neurodivergent students. Multi-signal checks + teacher review reduce false positives.")
+
